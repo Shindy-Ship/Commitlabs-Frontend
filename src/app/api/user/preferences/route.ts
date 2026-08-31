@@ -59,7 +59,10 @@ const WALLET_ADDRESS_PATTERN = /^0x[a-fA-F0-9]{40}$/;
 const DANGEROUS_KEY_PATTERN = /^(?:__proto__|prototype|constructor)$/;
 
 function assertWalletAddress(address: string): void {
-  if (!WALLET_ADDRESS_PATTERN.test(address)) {
+  if (
+    !WALLET_ADDRESS_PATTERN.test(address) ||
+    address.toLowerCase() === '0x0000000000000000000000000000000000000000'
+  ) {
     throw new ValidationError('Authenticated wallet identity is invalid.');
   }
 }
@@ -96,6 +99,21 @@ function stableStringify(value: unknown): string {
       .join(',')}}`;
   }
   return JSON.stringify(value) ?? 'null';
+}
+
+function deepMerge<T>(base: T, override: unknown): T {
+  if (override === null || override === undefined) return base;
+  if (Array.isArray(base) || Array.isArray(override)) {
+    return (override ?? base) as T;
+  }
+  if (typeof base === 'object' && typeof override === 'object') {
+    const merged: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+    for (const key of Object.keys(override as Record<string, unknown>)) {
+      merged[key] = deepMerge(merged[key], (override as Record<string, unknown>)[key]);
+    }
+    return merged as T;
+  }
+  return (override ?? base) as T;
 }
 
 function assertSafePreferenceKeys(value: unknown): void {
@@ -191,7 +209,7 @@ export function __resetIdempotency(): void {
  */
 export const GET = withApiHandler(
   async (req: NextRequest) => {
-    const address = requireWalletAuth(req.headers.get('authorization'));
+    const address = requireWalletAuth(req.headers.get('authorization')).toLowerCase();
     assertWalletAddress(address);
     validateNetworkHeader(req);
 
@@ -200,9 +218,9 @@ export const GET = withApiHandler(
     if (stored !== null && stored !== undefined) {
       const parsed = userPreferencesSchema.safeParse(stored);
       if (!parsed.success) {
-        throw new Error('Stored preferences are invalid.');
+        throw new Error('Stored preferences are invalid.');or('Stored preferences are invalid.');
       }
-      preferences = { ...DEFAULT_PREFERENCES, ...parsed.data };
+      preferences = deepMerge(DEFAULT_PREFERENCES, parsed.data);
     }
 
     return ok({ address, preferences });
@@ -255,7 +273,7 @@ export const GET = withApiHandler(
  *         description: Precondition failed — stored version changed since If-Match ETag was issued
  */
 export const PUT = withApiHandler(async (req: NextRequest) => {
-  const address = requireWalletAuth(req.headers.get('authorization'));
+  const address = requireWalletAuth(req.headers.get('authorization')).toLowerCase();
   assertWalletAddress(address);
   validateNetworkHeader(req);
 
@@ -310,6 +328,8 @@ export const PUT = withApiHandler(async (req: NextRequest) => {
         preferences: parsedCached.data,
         fromCache: true,
       });
+    } else if (cached) {
+      throw new ConflictError('Idempotency-Key is already in progress.');
     }
   }
 
