@@ -91,13 +91,14 @@ const listQuerySchema = z.object({
     .optional()
     .transform((v) => v === 'true'),
   network: z.enum(supportedNetworks).optional(),
-});
+}).strict();
 
 // ─── PATCH body validation ────────────────────────────────────────────────────
 
 const patchBodySchema = z.object({
   id: z
     .string()
+    .trim()
     .min(1, 'Notification id is required')
     .max(256, 'Notification id is too long')
     .refine((value) => value.trim().length > 0, 'Notification id cannot be blank'),
@@ -125,8 +126,8 @@ const walletAddressSchema = z.string().regex(
 );
 
 const notificationSchema = z.object({
-  id: z.string().min(1),
-  ownerAddress: z.string().min(1),
+  id: z.string().min(1).max(256),
+  ownerAddress: walletAddressSchema,
   read: z.boolean(),
 }).passthrough();
 
@@ -304,11 +305,12 @@ export const PATCH = withApiHandler(async (req: NextRequest) => {
   // Map action → state machine event
   const event = action === 'mark_read' ? 'MARK_READ' : 'ACKNOWLEDGE';
 
-  // Scope the idempotency key to (caller, network, key) so two different
-  // wallets or networks cannot inadvertently share the same cache slot.
+  // Scope the idempotency key to (caller, network, notification, event, key)
+  // so different wallets, networks, notifications, or actions cannot
+  // inadvertently share the same cache slot.
   const scopedKey = network
-    ? `notif:${network}:${address}:${idempotencyKey}`
-    : `notif:${address}:${idempotencyKey}`;
+    ? `notif:${network}:${address}:${id}:${event}:${idempotencyKey}`
+    : `notif:unknown:${address}:${id}:${event}:${idempotencyKey}`;
 
   const svc = getTransitionService();
   const { notification, fromCache } = await svc.transition(id, event, address, scopedKey);
