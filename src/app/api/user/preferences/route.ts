@@ -60,7 +60,7 @@ const DANGEROUS_KEY_PATTERN = /^(?:__proto__|prototype|constructor)$/;
 
 function assertWalletAddress(address: string): void {
   if (!WALLET_ADDRESS_PATTERN.test(address)) {
-    throw new Error('Authenticated wallet identity is invalid.');
+    throw new ValidationError('Authenticated wallet identity is invalid.');
   }
 }
 
@@ -128,7 +128,7 @@ async function readJsonBody(req: NextRequest): Promise<unknown> {
   }
 
   const text = await req.text();
-  if (text.length > MAX_PREFERENCES_BODY_BYTES) {
+  if (new TextEncoder().encode(text).length > MAX_PREFERENCES_BODY_BYTES) {
     throw new ValidationError('Request body exceeds the size limit.');
   }
   if (text.trim().length === 0) {
@@ -293,13 +293,21 @@ export const PUT = withApiHandler(async (req: NextRequest) => {
       requestHash?: string;
     }>(scopedKey);
     if (cached?.status === 'COMPLETED' && cached.response) {
-      if (cached.response.requestHash && cached.response.requestHash !== requestHash) {
+      if (
+        cached.response.address !== address ||
+        !cached.response.requestHash ||
+        cached.response.requestHash !== requestHash
+      ) {
         throw new ValidationError('Idempotency-Key was already used with a different request.');
+      }
+      const parsedCached = userPreferencesSchema.safeParse(cached.response.preferences);
+      if (!parsedCached.success) {
+        throw new Error('Cached idempotent response is invalid.');
       }
       // Return the previously committed result verbatim
       return ok({
-        address: cached.response.address,
-        preferences: cached.response.preferences,
+        address,
+        preferences: parsedCached.data,
         fromCache: true,
       });
     }
@@ -314,7 +322,14 @@ export const PUT = withApiHandler(async (req: NextRequest) => {
     }
 
     const current = await _store.get(address);
-    const currentPrefs: UserPreferences = current ?? { ...DEFAULT_PREFERENCES };
+    let currentPrefs: UserPreferences = { ...DEFAULT_PREFERENCES };
+    if (current !== null && current !== undefined) {
+      const parsedCurrent = userPreferencesSchema.safeParse(current);
+      if (!parsedCurrent.success) {
+        throw new Error('Stored preferences are invalid.');
+      }
+      currentPrefs = { ...DEFAULT_PREFERENCES, ...parsedCurrent.data };
+    }
     const currentETag = generateETag({ address, preferences: currentPrefs });
 
     // Normalize both sides to bare hash strings for comparison.
@@ -333,15 +348,6 @@ export const PUT = withApiHandler(async (req: NextRequest) => {
   const parsedPreferences = userPreferencesSchema.safeParse(storedPreferences);
   if (!parsedPreferences.success) {
     throw new Error('Stored preferences are invalid after update.');
-  }
-  return ok({
-    address,
-    preferences: parsedPreferences.data,
-    fromCache: false,
-  });
-});erPreferencesSchema.safeParse(storedPreferences);
-  if (!parsedPreferences.success) {
-    throw new Error('Preference store returned invalid preferences.');
   }
   const preferences: UserPreferences = { ...DEFAULT_PREFERENCES, ...parsedPreferences.data };
 
