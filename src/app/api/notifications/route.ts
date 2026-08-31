@@ -31,7 +31,7 @@ import { NextRequest } from 'next/server';
 import { z } from 'zod';
 import { withApiHandler } from '@/lib/backend/withApiHandler';
 import { ok } from '@/lib/backend/apiResponse';
-import { ValidationError } from '@/lib/backend/errors';
+import { ForbiddenError, ValidationError } from '@/lib/backend/errors';
 import { requireWalletAuth } from '@/lib/backend/preferences';
 import {
   getNotificationStore,
@@ -68,7 +68,7 @@ async function ensureSeeded(): Promise<void> {
   await store.seed(
     Array.from({ length: 12 }, (_, i) => ({
       id: `notif-seed-${i + 1}`,
-      ownerAddress: 'DEMO_OWNER',
+      ownerAddress: '0x1111111111111111111111111111111111111111',
       title: `Demo Notification ${i + 1}`,
       message: `This is demo notification ${i + 1}.`,
       severity: (['info', 'warning', 'critical'] as const)[i % 3],
@@ -84,8 +84,8 @@ async function ensureSeeded(): Promise<void> {
 const supportedNetworks = ['mainnet', 'sepolia', 'local'] as const;
 
 const listQuerySchema = z.object({
-  page: z.coerce.number().int().min(1).default(1),
-  pageSize: z.coerce.number().int().min(1).max(100).default(10),
+  page: z.coerce.number().finite().int().min(1).default(1),
+  pageSize: z.coerce.number().finite().int().min(1).max(100).default(10),
   unreadOnly: z
     .enum(['true', 'false'])
     .optional()
@@ -124,7 +124,7 @@ const patchBodySchema = z.object({
 const walletAddressSchema = z.string().regex(
   /^0x[a-fA-F0-9]{40}$/,
   'Wallet address must be a 40-character hex string starting with 0x',
-);
+).transform((value) => value.toLowerCase());
 
 const notificationSchema = z.object({
   id: z.string().min(1).max(256).regex(
@@ -133,11 +133,12 @@ const notificationSchema = z.object({
   ),
   ownerAddress: walletAddressSchema,
   read: z.boolean(),
+  network: z.enum(supportedNetworks).optional(),
 }).passthrough();
 
 const listResponseSchema = z.object({
   items: z.array(notificationSchema),
-  total: z.number().int().nonnegative(),
+  total: z.number().finite().int().nonnegative(),
 });
 
 const transitionResultSchema = z.object({
@@ -147,10 +148,11 @@ const transitionResultSchema = z.object({
 
 function getAuthenticatedWallet(req: NextRequest): string {
   const address = requireWalletAuth(req.headers.get('authorization'));
-  if (!walletAddressSchema.safeParse(address).success) {
+  const parsedAddress = walletAddressSchema.safeParse(address);
+  if (!parsedAddress.success) {
     throw new ValidationError('Invalid wallet identity.');
   }
-  return address.toLowerCase();
+  return parsedAddress.data;
 }
 
 // ─── Idempotency and transition service ──────────────────────────────────────
@@ -167,6 +169,31 @@ export function __resetIdempotencyService(): void {
 
 function getTransitionService(): NotificationTransitionService {
   return new NotificationTransitionService(getNotificationStore(), _idempotencyService);
+}
+
+async function assertNotificationOwnership(
+  id: string,
+  address: string,
+  network?: string,
+): Promise<void> {
+  const store = getNotificationStore();
+  const existing = await store.get(id);
+  if (!existing) return;
+
+  const parsed = notificationSchema.safeParse(existing);
+  if (!parsed.success) {
+    throw new Error('Notification store returned a malformed notification.');
+  }
+  if (parsed.data.ownerAddress.toLowerCase() !== address.toLowerCase()) {
+    throw new ForbiddenError('Caller does not own this notification.');
+  }
+  if (
+    network &&
+    parsed.data.network &&
+    parsed.data.network !== network
+  ) {
+    throw new ValidationError('Notification does not belong to the requested network.');
+  }
 }
 
 // ─── GET /api/notifications ───────────────────────────────────────────────────
@@ -201,8 +228,6 @@ function getTransitionService(): NotificationTransitionService {
 export const GET = withApiHandler(
   async (req: NextRequest) => {
     const address = getAuthenticatedWallet(req);
-    await ensureSeeded();
-
     const { searchParams } = new URL(req.url);
     const duplicateParams = [...new Set(searchParams.keys())].filter(
       (key) => searchParams.getAll(key).length > 1,
@@ -221,7 +246,8 @@ export const GET = withApiHandler(
       );
     }
 
-    const { page, pageSize, unreadOnly } = parsed.data;
+    const { page, pageSize, unreadOnly, network } = parsed.data;
+    await ensureSeeded();
     const store = getNotificationStore();
     const { items, total } = await store.list(address, { page, pageSize, unreadOnly });
 
@@ -231,6 +257,14 @@ export const GET = withApiHandler(
     }
     if (listResult.data.items.some((item) => item.ownerAddress.toLowerCase() !== address.toLowerCase())) {
       throw new Error('Notification store returned notifications for another wallet.');
+    }
+    if (
+      network &&
+      listResult.data.items.some(
+        (item) => item.network !== undefined && item.network !== network,
+      )
+    ) {
+      throw new Error('Notification store returned notifications for another network.');
     }
 
     return ok({
@@ -309,12 +343,14 @@ export const PATCH = withApiHandler(async (req: NextRequest) => {
   // Map action → state machine event
   const event = action === 'mark_read' ? 'MARK_READ' : 'ACKNOWLEDGE';
 
-  // Scope the idempotency key to (caller, network, notification, event, key)
-  // so different wallets, networks, notifications, or actions cannot
-  // inadvertently share the same cache slot.
+  // Scope the idempotency key to (caller, notification, event, key) so
+  // different wallets, notifications, or actions cannot inadvertently share
+  // the same cache slot. The `network` field is validated above and checked
+  // against the stored notification by assertNotificationOwnership; it is not
+  // part of the cache scope because retries must not be able to bypass the
+  // cache by toggling a client-supplied network value.
   const scopedKey = JSON.stringify([
     'notif',
-    network ?? 'unknown',
     address,
     id,
     event,
@@ -322,6 +358,7 @@ export const PATCH = withApiHandler(async (req: NextRequest) => {
   ]);
 
   const svc = getTransitionService();
+  await assertNotificationOwnership(id, address, network);
   const { notification, fromCache } = await svc.transition(id, event, address, scopedKey);
 
   const transitionResult = transitionResultSchema.safeParse({ notification, fromCache });
