@@ -207,6 +207,41 @@ describe('PUT /api/user/preferences', () => {
     expect(status).toBe(401);
   });
 
+  it('returns 401 when Authorization header references a disconnected wallet', async () => {
+    const DISCONNECTED_WALLET_TOKEN = `session_NOT_A_STELLAR_ADDRESS_1700000000000`;
+    const res = await PUT(
+      putReq({ displayCurrency: 'EUR' }, { authorization: `Bearer ${DISCONNECTED_WALLET_TOKEN}` }),
+      { params: {} },
+    );
+    const { status } = await parseResponse(res);
+    expect(status).toBe(401);
+  });
+
+  it('returns 401 when Authorization header references a different network (testnet)', async () => {
+    const res = await PUT(
+      putReq({ displayCurrency: 'EUR' }, { authorization: `Bearer ${TESTNET_TOKEN}` }),
+      { params: {} },
+    );
+    const { status } = await parseResponse(res);
+    expect(status).toBe(401);
+  });
+
+  it('returns 401 when the session token has been tampered with', async () => {
+    const res = await PUT(
+      putReq({ displayCurrency: 'EUR' }, { authorization: `Bearer session_${VALID_ADDRESS}_not-a-timestamp` }),
+      { params: {} },
+    );
+    const { status } = await parseResponse(res);
+    expect(status).toBe(401);
+  });
+
+  it('returns 500 when the preferences store returns malformed data after write', async () => {
+    store.upsert = async () => ({ displayCurrency: 123 }) as unknown as UserPreferences;
+    const res = await PUT(putReq({ displayCurrency: 'EUR' }), { params: {} });
+    const { status } = await parseResponse(res);
+    expect(status).toBe(500);
+  });
+
   it('returns 400 for unsupported displayCurrency', async () => {
     const res = await PUT(putReq({ displayCurrency: 'ZZZ' }), { params: {} });
     const { status, data } = await parseResponse(res);
