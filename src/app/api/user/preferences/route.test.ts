@@ -145,8 +145,7 @@ describe('GET /api/user/preferences', () => {
   it('returns ETag header for conditional polling', async () => {
     const res = await GET(getReq(), { params: {} });
     expect(res.status).toBe(200);
-    // withApiHandler injects ETag when enableETag=true
-    // The header exists at the transport level; verify the route executes cleanly
+    expect(res.headers.get('ETag')).toBeTruthy();
   });
 
   it('returns 401 when the session token is malformed', async () => {
