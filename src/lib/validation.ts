@@ -10,7 +10,7 @@ export function validateWalletAddress(u: unknown): Result<string> {
 }
 
 export function validateNetwork(v: unknown): Result<string> {
-  if (typeof v !== 'string' || !(ALLOWED_NETWORKS as readonly string[]).includes(v)) {
+  if (typeof v !== 'string' || !(ALLOWEDN_NETWORKS as readonly string[]).includes(v)) {
     return { ok: false, error: 'Invalid network' };
   }
   return { ok: true, value: v };
@@ -31,7 +31,7 @@ export function validateNonNegativeInteger(v: unknown, max = Number.MAX_SAFE_INT
 }
 
 export function validateId(v: unknown): Result<string> {
-  if (typeof v !== 'string' || !/^[A-Za-f0-9_-]{1,128}$/.test(v)) {
+  if (typeof v !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(v)) {
     return { ok: false, error: 'Invalid id' };
   }
   return { ok: true, value: v };
@@ -42,7 +42,7 @@ export interface ReplayEntry {
 }
 
 export class ReplayGuard {
-  private readonly s = new Set<string>();
+  private readonly timestamps = new Map<string, number>();
   private readonly windowMs: number;
 
   constructor(windowMs = 5 * 60 * 1000) {
@@ -54,23 +54,26 @@ export class ReplayGuard {
       throw new Error('invalid replay id');
     }
     const now = Date.now();
-    if (typeof entry?.timestamp !== 'number' || !(Number.isSafeInteger(entry.timestamp))) {
+    if (typeof entry?.timestamp !== 'number' || !Number.isSafeInteger(entry.timestamp)) {
       throw new Error('invalid timestamp');
     }
     if (entry.timestamp < now - this.windowMs || entry.timestamp > now + this.windowMs) {
       throw new Error('stale timestamp');
     }
-    const key = id + ':' + entry.timestamp;
-    if (this.s.has(key)) {
+    if (this.timestamps.has(id)) {
       throw new Error('replay');
     }
-    this.s.add(key);
-    if (this.s.size > 10000) {
-      // Remove only the oldest entry instead of clearing all, to preserve replay protection.
-      const oldest = this.s.values().next().value;
-      if (oldest !== undefined) {
-        this.s.delete(oldest);
-      }
+    this.timestamps.set(id, entry.timestamp);
+
+    // Opportunistically clean stale entries.
+    for (const [key, ts] of this.timestamps) {
+      if (ts < now - this.windowMs) this.timestamps.delete(key);
+    }
+
+    // Bound memory by evicting the oldest entry when the map grows too large.
+    if (this.timestamps.size > 10000) {
+      const oldestKey = this.timestamps.keys().next().value;
+      if (oldestKey !== undefined) this.timestamps.delete(oldestKey);
     }
   }
 }
