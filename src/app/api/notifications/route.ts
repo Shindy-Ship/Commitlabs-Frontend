@@ -81,19 +81,26 @@ async function ensureSeeded(): Promise<void> {
 
 // ─── Query validation ─────────────────────────────────────────────────────────
 
+const supportedNetworks = ['mainnet', 'sepolia', 'local'] as const;
+
 const listQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(10),
   unreadOnly: z
-    .string()
+    .enum(['true', 'false'])
     .optional()
     .transform((v) => v === 'true'),
+  network: z.enum(supportedNetworks).optional(),
 });
 
 // ─── PATCH body validation ────────────────────────────────────────────────────
 
 const patchBodySchema = z.object({
-  id: z.string().min(1, 'Notification id is required'),
+  id: z
+    .string()
+    .min(1, 'Notification id is required')
+    .max(256, 'Notification id is too long')
+    .refine((value) => value.trim().length > 0, 'Notification id cannot be blank'),
   action: z.enum(['mark_read', 'acknowledge'], {
     errorMap: () => ({ message: "action must be 'mark_read' or 'acknowledge'" }),
   }),
@@ -102,8 +109,44 @@ const patchBodySchema = z.object({
    * operation. A UUID is recommended. Re-sending the same key within 24h
    * returns the previously committed result without re-executing the transition.
    */
-  idempotencyKey: z.string().min(1, 'idempotencyKey is required'),
+  idempotencyKey: z
+    .string()
+    .min(1, 'idempotencyKey is required')
+    .max(128, 'idempotencyKey must be 128 characters or fewer')
+    .regex(/^[A-Za-z0-9._:-]+$/, 'idempotencyKey contains invalid characters'),
+  network: z.enum(supportedNetworks).optional(),
+}).strict();
+
+// ─── Server response validation ──────────────────────────────────────────────
+
+const walletAddressSchema = z.string().regex(
+  /^0x[a-fA-F0-9]{40}$/,
+  'Wallet address must be a 40-character hex string starting with 0x',
+);
+
+const notificationSchema = z.object({
+  id: z.string().min(1),
+  ownerAddress: z.string().min(1),
+  read: z.boolean(),
+}).passthrough();
+
+const listResponseSchema = z.object({
+  items: z.array(notificationSchema),
+  total: z.number().int().nonnegative(),
 });
+
+const transitionResultSchema = z.object({
+  notification: notificationSchema,
+  fromCache: z.boolean(),
+});
+
+function getAuthenticatedWallet(req: NextRequest): string {
+  const address = requireWalletAuth(req.headers.get('authorization'));
+  if (!walletAddressSchema.safeParse(address).success) {
+    throw new ValidationError('Invalid wallet identity.');
+  }
+  return address;
+}
 
 // ─── Idempotency and transition service ──────────────────────────────────────
 
@@ -152,10 +195,19 @@ function getTransitionService(): NotificationTransitionService {
  */
 export const GET = withApiHandler(
   async (req: NextRequest) => {
-    const address = requireWalletAuth(req.headers.get('authorization'));
+    const address = getAuthenticatedWallet(req);
     await ensureSeeded();
 
     const { searchParams } = new URL(req.url);
+    const duplicateParams = [...new Set(searchParams.keys())].filter(
+      (key) => searchParams.getAll(key).length > 1,
+    );
+    if (duplicateParams.length > 0) {
+      throw new ValidationError(
+        'Duplicate query parameters are not allowed.',
+        duplicateParams.map((field) => ({ field, message: `Duplicate query parameter: ${field}` })),
+      );
+    }
     const parsed = listQuerySchema.safeParse(Object.fromEntries(searchParams.entries()));
     if (!parsed.success) {
       throw new ValidationError(
@@ -168,7 +220,18 @@ export const GET = withApiHandler(
     const store = getNotificationStore();
     const { items, total } = await store.list(address, { page, pageSize, unreadOnly });
 
-    return ok({ items, meta: { page, pageSize, total, unreadOnly } });
+    const listResult = listResponseSchema.safeParse({ items, total });
+    if (!listResult.success) {
+      throw new Error('Notification store returned a malformed list response.');
+    }
+    if (listResult.data.items.some((item) => item.ownerAddress.toLowerCase() !== address.toLowerCase())) {
+      throw new Error('Notification store returned notifications for another wallet.');
+    }
+
+    return ok({
+      items: listResult.data.items,
+      meta: { page, pageSize, total: listResult.data.total, unreadOnly },
+    });
   },
   { enableETag: true, cachePrivacy: 'private' },
 );
@@ -218,7 +281,7 @@ export const GET = withApiHandler(
  *         description: Invalid or terminal-state transition
  */
 export const PATCH = withApiHandler(async (req: NextRequest) => {
-  const address = requireWalletAuth(req.headers.get('authorization'));
+  const address = getAuthenticatedWallet(req);
 
   // Parse body
   let body: unknown;
@@ -236,17 +299,30 @@ export const PATCH = withApiHandler(async (req: NextRequest) => {
     );
   }
 
-  const { id, action, idempotencyKey } = result.data;
+  const { id, action, idempotencyKey, network } = result.data;
 
   // Map action → state machine event
   const event = action === 'mark_read' ? 'MARK_READ' : 'ACKNOWLEDGE';
 
-  // Scope the idempotency key to (caller, key) so two different wallets
-  // cannot inadvertently share the same cache slot.
-  const scopedKey = `notif:${address}:${idempotencyKey}`;
+  // Scope the idempotency key to (caller, network, key) so two different
+  // wallets or networks cannot inadvertently share the same cache slot.
+  const scopedKey = network
+    ? `notif:${network}:${address}:${idempotencyKey}`
+    : `notif:${address}:${idempotencyKey}`;
 
   const svc = getTransitionService();
   const { notification, fromCache } = await svc.transition(id, event, address, scopedKey);
 
-  return ok({ notification, fromCache });
+  const transitionResult = transitionResultSchema.safeParse({ notification, fromCache });
+  if (!transitionResult.success) {
+    throw new Error('Notification store returned a malformed transition result.');
+  }
+  if (transitionResult.data.notification.ownerAddress.toLowerCase() !== address.toLowerCase()) {
+    throw new Error('Notification transition returned a notification for another wallet.');
+  }
+
+  return ok({
+    notification: transitionResult.data.notification,
+    fromCache: transitionResult.data.fromCache,
+  });
 });
