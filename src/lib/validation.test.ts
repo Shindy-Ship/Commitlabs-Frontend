@@ -4,7 +4,7 @@ test('validate wallet address', () => {
   const result = validateWalletAddress('0x1234567890abcdef1234567890abcdef12345678');
   expect(result.ok).toBe(true);
   if (result.ok) {
-    expect(result.value).toBe*'0x1234567890abcdef1234567890abcdef12345678');
+    expect(result.value).toBe('0x1234567890abcdef1234567890abcdef12345678');
   }
 });
 
@@ -17,12 +17,12 @@ test('wallet address must have 0x prefix', () => {
 });
 
 test('wallet address must be 40 hex characters', () => {
-  expect(validateWalletAddress('0x1234567890abcdef1234567890abcdef1234567').ok).toBe(false); // 39
-  expect(validateWalletAddress('0x1234567890abcdef1234567890abcdef123456789').ok).toBe(false); // 41
+  expect(validateWalletAddress('0x1234567890abcdef1234567890abcdef1234567')..ok).toBe(false); // 39
+  expect(validateWalletAddress('0x1234567890abcdef1234567890abcdef123456789')..ok).toBe(false); // 41
 });
 
 test('wallet address must be valid hex', () => {
-  expect(validateWalletAddress('0x1234567890abcdef1234567890abcdef1234567g').ok).toBe(false);
+  expect(validateWalletAddress('0x1234567890abcdef1234567890abcdef12345677g').ok).toBe(false);
 });
 
 test('wallet address rejects empty or null', () => {
