@@ -52,6 +52,87 @@ import {
   type UserPreferences,
 } from '@/lib/backend/preferences';
 
+const MAX_PREFERENCES_BODY_BYTES = 16384;
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._~+=-]{1,255}$/;
+const IF_MATCH_PATTERN = /^(?:"[A-Za-z0-9._~+-]+"|[A-Za-z0-9._~+-]+)$/;
+const WALLET_ADDRESS_PATTERN = /^0x[a-fA-F0-9]{40}$/;
+const DANGEROUS_KEY_PATTERN = /^(?:__proto__|prototype|constructor)$/;
+
+function assertWalletAddress(address: string): void {
+  if (!WALLET_ADDRESS_PATTERN.test(address)) {
+    throw new Error('Authenticated wallet identity is invalid.');
+  }
+}
+
+function validateNetworkHeader(req: NextRequest): void {
+  const networkHeader = req.headers.get('x-chain-id') ?? req.headers.get('x-network');
+  if (networkHeader === null) return;
+
+  const trimmed = networkHeader.trim();
+  const numericChainId = Number(trimmed);
+  if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(numericChainId) || numericChainId <= 0) {
+    throw new ValidationError('Network identifier must be a positive integer.');
+  }
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableStringify(entry)).join(',')}]`;
+  }
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+function assertSafePreferenceKeys(value: unknown): void {
+  if (Array.isArray(value)) {
+    for (const entry of value) assertSafePreferenceKeys(entry);
+    return;
+  }
+  if (value === null || typeof value !== 'object') return;
+
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (DANGEROUS_KEY_PATTERN.test(key)) {
+      throw new ValidationError(`Unsupported preference field: ${key}`);
+    }
+    assertSafePreferenceKeys(child);
+  }
+}
+
+async function readJsonBody(req: NextRequest): Promise<unknown> {
+  const contentType = req.headers.get('content-type') ?? '';
+  if (!contentType.toLowerCase().includes('application/json')) {
+    throw new ValidationError('Content-Type must be application/json.');
+  }
+
+  const contentLength = req.headers.get('content-length');
+  if (contentLength !== null) {
+    const length = Number(contentLength);
+    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_PREFERENCES_BODY_BYTES) {
+      throw new ValidationError('Request body exceeds the size limit.');
+    }
+  }
+
+  const text = await req.text();
+  if (text.length > MAX_PREFERENCES_BODY_BYTES) {
+    throw new ValidationError('Request body exceeds the size limit.');
+  }
+  if (text.trim().length === 0) {
+    throw new ValidationError('Request body must be valid JSON.');
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new ValidationError('Request body must be valid JSON.');
+  }
+}
+
 // ─── Store injection (test seam) ─────────────────────────────────────────────
 
 let _store: PreferencesStore = jsonFilePreferencesStore;
@@ -102,9 +183,18 @@ export function __resetIdempotency(): void {
 export const GET = withApiHandler(
   async (req: NextRequest) => {
     const address = requireWalletAuth(req.headers.get('authorization'));
+    assertWalletAddress(address);
+    validateNetworkHeader(req);
 
     const stored = await _store.get(address);
-    const preferences: UserPreferences = stored ?? { ...DEFAULT_PREFERENCES };
+    let preferences: UserPreferences = { ...DEFAULT_PREFERENCES };
+    if (stored !== null && stored !== undefined) {
+      const parsed = userPreferencesSchema.safeParse(stored);
+      if (!parsed.success) {
+        throw new Error('Stored preferences are invalid.');
+      }
+      preferences = { ...DEFAULT_PREFERENCES, ...parsed.data };
+    }
 
     return ok({ address, preferences });
   },
@@ -157,28 +247,19 @@ export const GET = withApiHandler(
  */
 export const PUT = withApiHandler(async (req: NextRequest) => {
   const address = requireWalletAuth(req.headers.get('authorization'));
+  assertWalletAddress(address);
+  validateNetworkHeader(req);
 
   // ── Idempotency key (optional) ────────────────────────────────────────────
   const idempotencyKey = req.headers.get('idempotency-key');
+  if (idempotencyKey !== null && !IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
+    throw new ValidationError('Invalid Idempotency-Key header.');
+  }
   const scopedKey = idempotencyKey ? `prefs:${address}:${idempotencyKey}` : null;
 
-  if (scopedKey) {
-    const cached = await _idempotency.getRecord<{ address: string; preferences: UserPreferences }>(
-      scopedKey,
-    );
-    if (cached?.status === 'COMPLETED' && cached.response) {
-      // Return the previously committed result verbatim
-      return ok({ ...cached.response, fromCache: true });
-    }
-  }
-
   // ── Parse body ────────────────────────────────────────────────────────────
-  let body: unknown;
-  try {
-    body = await req.json();
-  } catch {
-    throw new ValidationError('Request body must be valid JSON.');
-  }
+  const body = await readJsonBody(req);
+  assertSafePreferenceKeys(body);
 
   const result = userPreferencesSchema.safeParse(body);
   if (!result.success) {
@@ -193,18 +274,45 @@ export const PUT = withApiHandler(async (req: NextRequest) => {
     throw new ValidationError('Request body must contain at least one preference field.');
   }
 
+  const requestHash = stableStringify(result.data);
+
+  // ── Idempotency replay (after body validation) ────────────────────────────
+  if (scopedKey) {
+    const cached = await _idempotency.getRecord<{
+      address: string;
+      preferences: UserPreferences;
+      requestHash?: string;
+    }>(scopedKey);
+    if (cached?.status === 'COMPLETED' && cached.response) {
+      if (cached.response.requestHash && cached.response.requestHash !== requestHash) {
+        throw new ValidationError('Idempotency-Key was already used with a different request.');
+      }
+      // Return the previously committed result verbatim
+      return ok({
+        address: cached.response.address,
+        preferences: cached.response.preferences,
+        fromCache: true,
+      });
+    }
+  }
+
   // ── Optimistic concurrency (If-Match) ─────────────────────────────────────
   const ifMatch = req.headers.get('if-match');
-  if (ifMatch) {
+  if (ifMatch !== null) {
+    const trimmedIfMatch = ifMatch.trim();
+    if (trimmedIfMatch.length === 0 || !IF_MATCH_PATTERN.test(trimmedIfMatch)) {
+      throw new ValidationError('If-Match header must be a valid entity tag.');
+    }
+
     const current = await _store.get(address);
     const currentPrefs: UserPreferences = current ?? { ...DEFAULT_PREFERENCES };
     const currentETag = generateETag({ address, preferences: currentPrefs });
 
     // Normalize both sides to bare hash strings for comparison.
     // generateETag returns `"<hash>"` (quoted). The If-Match header value may
-    // arrive quoted or bare; strip outer double-quotes and the W/ prefix.
-    const normalize = (tag: string) => tag.replace(/^W\//i, '').replace(/^"|"$/g, '');
-    if (normalize(ifMatch) !== normalize(currentETag)) {
+    // arrive quoted or bare; strip outer double-quotes for comparison.
+    const normalize = (tag: string) => tag.replace(/^"|"$/g, '');
+    if (normalize(trimmedIfMatch) !== normalize(currentETag)) {
       throw new ConflictError(
         'Preferences have been modified since your last read. Fetch the current version and retry.',
       );
@@ -212,14 +320,19 @@ export const PUT = withApiHandler(async (req: NextRequest) => {
   }
 
   // ── Apply update ──────────────────────────────────────────────────────────
-  const preferences = await _store.upsert(address, result.data);
+  const storedPreferences = await _store.upsert(address, result.data);
+  const parsedPreferences = userPreferencesSchema.safeParse(storedPreferences);
+  if (!parsedPreferences.success) {
+    throw new Error('Preference store returned invalid preferences.');
+  }
+  const preferences: UserPreferences = { ...DEFAULT_PREFERENCES, ...parsedPreferences.data };
 
   const responsePayload = { address, preferences, fromCache: false as boolean | undefined };
 
   // ── Record idempotency result ─────────────────────────────────────────────
   if (scopedKey) {
     // Store without fromCache so the cached version rebuilds it correctly
-    await _idempotency.complete(scopedKey, { address, preferences }, 200);
+    await _idempotency.complete(scopedKey, { address, preferences, requestHash }, 200);
   }
 
   return ok(responsePayload);
