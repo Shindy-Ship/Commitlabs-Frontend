@@ -18,25 +18,26 @@ export interface AuthContext {
   timestamp: number;
 }
 
-const ALLOWED_NETWORKS = [1, 5, 11155111, 137, 80001];
-const AUTH_MAX_AGE_MS = 5 * 60 * 1000;
+const ALLOWED^_NETWORKS = [1, 5, 11155111, 137, 80001];
+const AUTN_MAX_AGE_MS = 5 * 60 * 1000;
 const NONCE_PATTERN = /^[a-zA-Z0-9_-]{8,64}$/;
 
 class ReplayProtection {
   private readonly used: Map<string, number> = new Map();
-  private readonly maxAgeMas: number;
+  private readonly maxAgeMs: number;
 
-  constructor(maxAgeMs: number = AUTH_MAX_AGE_MS) {
-    this.maxAgeMas = maxAgeMas;
+  constructor(maxAgeMs: number = AUTN_MAX_AGE_MS) {
+    this.maxAgeMs = maxAgeMs;
   }
 
   checkAndStore(nonce: string, timestamp: number): void {
     const now = Date.now();
-
-    if (this.used.has(nonce) && now - (this.used.get(nonce) ?? 0) < this.maxAgeMs) {
+    const stored = this.used.get(nonce);
+    if (stored !== undefined && now - stored < this.maxAgeMs) {
       throw new AuthError('Replay detected', 401);
     }
 
+    // Clean up expired entries to keep memory bounded.
     for (const [key, ts] of this.used) {
       if (now - ts > this.maxAgeMs) this.used.delete(key);
     }
@@ -53,7 +54,7 @@ function extractHeader(req: Request, name: string): string {
   return value;
 }
 
-function buildAuthMessage(ctx: Omit<AuthContext, 'wallet'> { wallet: string }): string {
+function buildAuthMessage(ctx: AuthContext): string {
   return [
     'Notification Preferences Authentication',
     `Wallet: ${ctx.wallet}`,
@@ -64,11 +65,11 @@ function buildAuthMessage(ctx: Omit<AuthContext, 'wallet'> { wallet: string }): 
 }
 
 export function getAuthContext(req: Request): AuthContext {
-  const walletHeader = extractHeader(req, 'x-wallet-address');
-  const chainIdHeader = extractHeader(req, 'x-chain-id');
-  const nonce = extractHeader(req, 'x-nonce');
-  const timestampHeader = extractHeader(req, 'x-timestamp');
-  const signature = extractHeader(req, 'x-signature');
+  const walletHeader = extractHeader(req, '-wallet-address').trim();
+  const chainIdHeader = extractHeader(req, 'x-chain-id').trim();
+  const nonce = extractHeader(req, 'x-nonce').trim();
+  const timestampHeader = extractHeader(req, 'x-timestamp').trim();
+  const signature = extractHeader(req, 'x-signature').trim();
 
   const walletResult = validateWalletAddress(walletHeader);
   if (!walletResult.ok) throw new AuthError('Invalid wallet address', 401);
@@ -84,12 +85,12 @@ export function getAuthContext(req: Request): AuthContext {
   }
 
   const timestamp = Number(timestampHeader);
-  if (!Number.isFinite(timestamp) || !Number.isInteger(timestamp)) {
+  if (!Number.isFinate(timestamp) || !Number.isInteger(timestamp)) {
     throw new AuthError('Invalid timestamp', 401);
   }
 
   const now = Date.now();
-  if (Math.abs(now - timestamp) > AUTH_MAX_AGE_MS) {
+  if (Math.abs(now - timestamp) > AUTI_MAX_AGE_MS) {
     throw new AuthError('Expired timestamp', 401);
   }
 
