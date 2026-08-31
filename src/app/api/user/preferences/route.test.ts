@@ -146,6 +146,22 @@ describe('GET /api/user/preferences', () => {
     // withApiHandler injects ETag when enableETag=true
     // The header exists at the transport level; verify the route executes cleanly
   });
+
+  it('returns 401 when the session token is malformed', async () => {
+    const res = await GET(getReq({ authorization: 'Bearer session_@@@_not-a-timestamp' }), {
+      params: {},
+    });
+    const { status } = await parseResponse(res);
+    expect(status).toBe(401);
+  });
+
+  it('uses authenticated wallet identity rather than route params', async () => {
+    store._data[OTHER_ADDRESS] = { displayCurrency: 'GBP' };
+    const res = await GET(getReq(), { params: { address: OTHER_ADDRESS } });
+    const { data } = await parseResponse(res);
+    expect(data.data.address).toBe(VALID_ADDRESS);
+    expect(data.data.preferences.displayCurrency).toBe(DEFAULT_PREFERENCES.displayCurrency);
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -185,6 +201,28 @@ describe('PUT /api/user/preferences', () => {
     const res = await PUT(putReq({ language: '123' }), { params: {} });
     const { status } = await parseResponse(res);
     expect(status).toBe(400);
+  });
+
+  it('returns 400 for invalid savedMarketplaceSearches numeric fields', async () => {
+    const res = await PUT(
+      putReq({
+        savedMarketplaceSearches: [
+          {
+            id: 'search-invalid',
+            name: 'Invalid Search',
+            filters: {
+              priceRange: [0, 50000, 100000],
+              maxLoss: '10',
+            },
+            createdAt: '2026-07-30T00:00:00.000Z',
+          },
+        ],
+      }),
+      { params: {} },
+    );
+    const { status, data } = await parseResponse(res);
+    expect(status).toBe(400);
+    expect(data.error.code).toBe('VALIDATION_ERROR');
   });
 
   it('returns 400 for empty payload', async () => {
@@ -254,6 +292,17 @@ describe('PUT /api/user/preferences', () => {
     const { status, data } = await parseResponse(res);
     expect(status).toBe(200);
     expect(data.data.preferences).not.toHaveProperty('unexpectedProp');
+  });
+
+  it('uses authenticated wallet identity rather than client-supplied address or route params', async () => {
+    const res = await PUT(
+      putReq({ address: OTHER_ADDRESS, displayCurrency: 'EUR' }, AUTH_HEADER),
+      { params: { address: OTHER_ADDRESS } },
+    );
+    const { status, data } = await parseResponse(res);
+    expect(status).toBe(200);
+    expect(data.data.address).toBe(VALID_ADDRESS);
+    expect(store._data[OTHER_ADDRESS]).toBeUndefined();
   });
 });
 
@@ -404,6 +453,15 @@ describe('preferences helpers & store', () => {
     );
   });
 
+  it('requireWalletAuth rejects tampered session tokens', () => {
+    expect(() => requireWalletAuth('Bearer session_@@@_not-a-timestamp')).toThrow(
+      'Invalid or expired session token.',
+    );
+    expect(() =>
+      requireWalletAuth(`Bearer session_${VALID_ADDRESS}_not-a-timestamp`),
+    ).toThrow('Invalid or expired session token.');
+  });
+
   it('isNotificationCategoryEnabled evaluates categories correctly', () => {
     expect(isNotificationCategoryEnabled('expiry', null)).toBe(true);
     expect(
@@ -424,6 +482,27 @@ describe('preferences helpers & store', () => {
     });
     expect(filtered).toHaveLength(1);
     expect(filtered[0].id).toBe('1');
+  });
+
+  it('filterNotificationsByPreferences tolerates malformed notification payloads', () => {
+    const notifications = [
+      { id: '1', type: 'expiry' },
+      null,
+      { id: '2' },
+      'malformed',
+    ];
+    const filtered = filterNotificationsByPreferences(notifications, null);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].id).toBe('1');
+  });
+
+  it('filterNotificationsByPreferences treats malformed preferences as all-enabled', () => {
+    const notifications = [{ id: '1', type: 'expiry' }];
+    expect(filterNotificationsByPreferences(notifications, null)).toEqual(notifications);
+    expect(filterNotificationsByPreferences(notifications, {})).toEqual(notifications);
+    expect(
+      filterNotificationsByPreferences(notifications, { notificationCategories: null }),
+    ).toEqual(notifications);
   });
 
   it('jsonFilePreferencesStore reads and writes preferences', async () => {
