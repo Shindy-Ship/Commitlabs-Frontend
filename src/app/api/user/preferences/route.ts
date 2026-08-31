@@ -65,10 +65,19 @@ function assertWalletAddress(address: string): void {
 }
 
 function validateNetworkHeader(req: NextRequest): void {
-  const networkHeader = req.headers.get('x-chain-id') ?? req.headers.get('x-network');
-  if (networkHeader === null) return;
+  const chainIdHeader = req.headers.get('x-chain-id');
+  const networkHeader = req.headers.get('x-network');
+  if (chainIdHeader === null && networkHeader === null) return;
 
-  const trimmed = networkHeader.trim();
+  const values: string[] = [];
+  if (chainIdHeader !== null) values.push(chainIdHeader.trim());
+  if (networkHeader !== null) values.push(networkHeader.trim());
+
+  if (new Set(values).size > 1) {
+    throw new ValidationError('Conflicting network identifiers were provided.');
+  }
+
+  const trimmed = values[0];
   const numericChainId = Number(trimmed);
   if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(numericChainId) || numericChainId <= 0) {
     throw new ValidationError('Network identifier must be a positive integer.');
@@ -322,6 +331,15 @@ export const PUT = withApiHandler(async (req: NextRequest) => {
   // ── Apply update ──────────────────────────────────────────────────────────
   const storedPreferences = await _store.upsert(address, result.data);
   const parsedPreferences = userPreferencesSchema.safeParse(storedPreferences);
+  if (!parsedPreferences.success) {
+    throw new Error('Stored preferences are invalid after update.');
+  }
+  return ok({
+    address,
+    preferences: parsedPreferences.data,
+    fromCache: false,
+  });
+});erPreferencesSchema.safeParse(storedPreferences);
   if (!parsedPreferences.success) {
     throw new Error('Preference store returned invalid preferences.');
   }
