@@ -43,6 +43,8 @@ const VALID_TOKEN = `session_${VALID_ADDRESS}_1700000000000`;
 const OTHER_TOKEN = `session_${OTHER_ADDRESS}_1700000000000`;
 const AUTH_HEADER = { authorization: `Bearer ${VALID_TOKEN}` };
 const OTHER_AUTH = { authorization: `Bearer ${OTHER_TOKEN}` };
+const TESTNET_ADDRESS = 'TCCC3333333333333333333333333333333333333';
+const TESTNET_TOKEN = `session_${TESTNET_ADDRESS}_1700000000000`;
 
 // ─── In-memory store ──────────────────────────────────────────────────────────
 function makeInMemoryStore(): PreferencesStore & { _data: Record<string, UserPreferences> } {
@@ -153,6 +155,27 @@ describe('GET /api/user/preferences', () => {
     });
     const { status } = await parseResponse(res);
     expect(status).toBe(401);
+  });
+
+  it('rejects session tokens for a different network (testnet)', async () => {
+    const res = await GET(getReq({ authorization: `Bearer ${TESTNET_TOKEN}` }), { params: {} });
+    const { status, data } = await parseResponse(res);
+    expect(status).toBe(401);
+    expect(data.error.code).toBe('UNAUTHORIZED');
+  });
+
+  it('rejects session tokens for a disconnected or invalid wallet', async () => {
+    const INVALID_ADDRESS_TOKEN = `session_NOT_A_STELLAR_ADDRESS_1700000000000`;
+    const res = await GET(getReq({ authorization: `Bearer ${INVALID_ADDRESS_TOKEN}` }), { params: {} });
+    const { status } = await parseResponse(res);
+    expect(status).toBe(401);
+  });
+
+  it('returns 500 when the preferences store returns malformed data', async () => {
+    store._data[VALID_ADDRESS] = { displayCurrency: 123 } as unknown as UserPreferences;
+    const res = await GET(getReq(), { params: {} });
+    const { status } = await parseResponse(res);
+    expect(status).toBe(500);
   });
 
   it('uses authenticated wallet identity rather than route params', async () => {
