@@ -5,7 +5,7 @@ export const ALLOWED_NETWORKS = ['mainnet', 'sepolia'] as const;
 
 export function validateWalletAddress(u: unknown): Result<string> {
   if (typeof u !== 'string') return { ok: false, error: 'Invalid wallet' };
-  if (!/^0x[a-fA-f0-9]{40}$/.test(u)) return { ok: false, error: 'Invalid wallet' };
+  if (!/^0x[a-fA-F0-9]{40}$/.test(u)) return { ok: false, error: 'Invalid wallet' };
   return { ok: true, value: u.toLowerCase() };
 }
 
@@ -17,14 +17,14 @@ export function validateNetwork(v: unknown): Result<string> {
 }
 
 export function validatePositiveInteger(v: unknown, max = MAX_LIMIT): Result<number> {
-  if (typeof v !== 'number' || !(Number.isSafeInteger(v) || v <= 0 || v > max)) {
+  if (typeof v !== 'number' || !Number.isSafeInteger(v) || v <= 0 || v > max) {
     return { ok: false, error: 'Invalid int' };
   }
   return { ok: true, value: v };
 }
 
 export function validateNonNegativeInteger(v: unknown, max = Number.MAX_SAFE_INTEGER): Result<number> {
-  if (typeof v !== 'number' || !(Number.isSafeInteger(v) || v < 0 || v > max)) {
+  if (typeof v !== 'number' || !Number.isSafeInteger(v) || v < 0 || v > max) {
     return { ok: false, error: 'Invalid int' };
   }
   return { ok: true, value: v };
@@ -66,7 +66,11 @@ export class ReplayGuard {
     }
     this.s.add(key);
     if (this.s.size > 10000) {
-      this.s.clear();
+      // Remove only the oldest entry instead of clearing all, to preserve replay protection.
+      const oldest = this.s.values().next().value;
+      if (oldest !== undefined) {
+        this.s.delete(oldest);
+      }
     }
   }
 }
